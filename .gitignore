@@ -4,8 +4,8 @@
 backend/venv/
 backend/.env
 backend/chats/*.json
-backend/__pycache__/
-backend/*.pyc
+__pycache__/
+*.pyc
 
 # frontend
 frontend/node_modules/
