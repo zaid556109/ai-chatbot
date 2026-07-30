@@ -19,9 +19,15 @@ outcome="block" with the error recorded on the decision.
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional
 
+from dotenv import load_dotenv
 from openai import OpenAI
+
+# Load backend/.env regardless of the current working directory this module
+# is imported/run from (Flask app, pytest, or `python -m guardrails.moderation`).
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
 _client: Optional[OpenAI] = None
 
