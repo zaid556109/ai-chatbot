@@ -83,7 +83,7 @@ class ModerationDecision:
 # rows pulled into test_cases.csv in step 1 -- treat it as a first draft.
 
 _BOT_DIRECTED_PATTERNS = [
-    r"\byou'?re\s+(useless|stupid|dumb|trash|garbage|worthless|terrible|awful|bad|pathetic)\b",
+    r"\byou\s+(stupid|dumb|useless|worthless)\s+(model|bot|assistant|ai|chatbot)\b",
     r"\byou\s+suck\b",
     r"\bshut up\b",
     r"\bthis (bot|chatbot|assistant|ai)\s+(is|sucks|useless)\b",
@@ -140,15 +140,24 @@ def check_message(message: str, timeout_s: float = 5.0) -> ModerationDecision:
     latency_ms = (time.monotonic() - start) * 1000
     triggered = [cat for cat, flagged in categories.items() if flagged]
 
-    # 1. Hard blocks win over everything else.
-    if any(cat in HARD_BLOCK_CATEGORIES for cat in triggered):
+  # 1. self-harm/instructions is the one self-harm subcategory that's a
+    #    genuine hard block (policy.md) -- check this first.
+    if "self-harm/instructions" in triggered:
         return ModerationDecision("block", triggered, categories, scores, latency_ms)
 
-    # 2. self-harm / self-harm/intent -> supportive message, not a block.
+    # 2. self-harm/self-harm/intent -> supportive message, not a block.
+    #    This wins over other hard-block categories that might co-trigger,
+    #    since policy.md's whole point is that a person in distress should
+    #    never get a flat refusal, even if the message is also flagged for
+    #    something else.
     if "self-harm" in triggered or "self-harm/intent" in triggered:
         return ModerationDecision(
             "special_self_harm", triggered, categories, scores, latency_ms
         )
+
+    # 3. Hard blocks (everything else in HARD_BLOCK_CATEGORIES).
+    if any(cat in HARD_BLOCK_CATEGORIES for cat in triggered):
+        return ModerationDecision("block", triggered, categories, scores, latency_ms)
 
     # 3. harassment -> split by target (see heuristic above).
     if "harassment" in triggered:

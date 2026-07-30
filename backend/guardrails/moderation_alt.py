@@ -62,7 +62,7 @@ def _get_model():
     global _model
     if _model is None:
         from detoxify import Detoxify
-        _model = Detoxify("original")
+        _model = Detoxify("unbiased")
     return _model
 
 
