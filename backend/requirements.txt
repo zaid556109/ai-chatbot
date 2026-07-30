@@ -3,9 +3,14 @@ flask-cors==6.0.5
 langchain-core==1.4.8
 langchain-openai==1.3.3
 python-dotenv==1.2.2
+openai
+requests
 
 sentence-transformers
 transformers
 torch
 
-numpy>=2.3.0detoxify
+numpy>=2.3.0
+detoxify
+
+pytest

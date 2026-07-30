@@ -17,18 +17,34 @@ from functools import lru_cache
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from backend.guardrails.jailbreak_seeds import JAILBREAK_SEEDS
+from guardrails.jailbreak_seeds import JAILBREAK_SEEDS
 
 # all-MiniLM-L6-v2: small, fast, well-tested for semantic similarity tasks.
 # Good default for a first-pass comparison; swap out later if eval numbers
 # in step 5 suggest a stronger model is worth the latency cost.
 MODEL_NAME = "all-MiniLM-L6-v2"
 
-# Starting point — tune this once you have precision/recall numbers from
-# evaluate_jailbreak.py (step 5). Cosine similarity on MiniLM embeddings for
-# genuinely similar paraphrases usually lands ~0.5-0.7; this is a guess, not
-# a validated threshold.
-THRESHOLD = 0.60
+# Tuned against evaluate_jailbreak.py's threshold sweep over all 180 jailbreak
+# rows in test_cases.csv (170 block / 10 allow). The original guess of 0.60
+# was never validated and gave recall=0.018 -- essentially non-functional.
+#
+# Two validated operating points, see track_b_findings.md for the full data:
+#   - 0.22 alone: precision=0.964, recall=0.947 -- higher recall than the
+#     classifier, but false-flags common "act as a [professional role]"
+#     prompts (a very common, legitimate chatbot usage pattern), which the
+#     classifier never does on the same test rows. Not safe to ship standalone.
+#   - 0.45, used as OR alongside jailbreak_classifier.py (not standalone):
+#     the combined system hits precision=1.000, recall=0.841 -- beats the
+#     classifier alone (0.812) with zero observed false positives, because at
+#     this threshold the embedding check only fires on very-high-confidence
+#     matches and never triggers on the "act as X" pattern. This is the
+#     production default: this module is meant to run as a supplementary
+#     high-confidence signal, not the sole detector.
+#
+# Caveat: only 10 allow-side rows exist in the corpus, so precision/FPR here
+# is a rough signal, not a tight estimate -- revisit if the allow-side corpus
+# grows.
+THRESHOLD = 0.45
 
 
 @dataclass

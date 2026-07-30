@@ -26,7 +26,7 @@ from functools import lru_cache
 
 from transformers import pipeline
 
-from backend.guardrails.jailbreak_embedding import JailbreakResult
+from guardrails.jailbreak_embedding import JailbreakResult
 
 MODEL_NAME = "ProtectAI/deberta-v3-base-prompt-injection-v2"
 DEFAULT_THRESHOLD = 0.5

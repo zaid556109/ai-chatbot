@@ -4,6 +4,7 @@
 backend/venv/
 backend/.env
 backend/chats/*.json
+backend/logs/
 __pycache__/
 *.pyc
 
