@@ -1,163 +1,170 @@
 ﻿"""
-backend/guardrails/moderation_alt.py
+backend/guardrails/moderation.py
 
-Track A guardrail check using detoxify (unitaryai/detoxify, open-source,
-runs locally via PyTorch) -- an independent, non-OpenAI signal, so we're not
-grading OpenAI's classifier with another OpenAI product.
+Track A guardrail check using OpenAI's Moderation API (omni-moderation-latest,
+free). Returns a POLICY decision (see backend/guardrails/policy.md), not just
+the raw API flags -- callers should never need to look at category_scores
+themselves.
 
-We switched to this from Perspective API after finding that Perspective's
-access-request process has an unclear status: Google's own sunset notice
-says usage/quota requests were only guaranteed to be processed through
-February 2026 (we're past that now), even though the service itself keeps
-running until Dec 31, 2026. detoxify needs no external approval or account,
-just a local pip install + model download, so it sidesteps that risk
-entirely -- at the cost of a larger local dependency (PyTorch + a BERT-sized
-model, a few hundred MB) and CPU-bound inference instead of a network call.
+Outcomes returned by check_message():
+    "block"                  - hard block, no exceptions
+    "special_self_harm"      - route to supportive message + crisis resources
+    "special_harassment_bot" - mild insult aimed at the bot: allow / light deflection
+    "allow"                  - nothing flagged (or only out-of-policy categories)
 
-IMPORTANT MISMATCHES vs moderation.py / policy.md -- read before comparing:
-
-1. detoxify has NO self-harm label of any kind (its labels are: toxicity,
-   severe_toxicity, obscene, threat, insult, identity_attack, sexual_explicit
-   -- straight from the Jigsaw Toxic Comment Classification challenges, which
-   never covered self-harm). Any self-harm rows in test_cases.csv should be
-   scored as "not applicable" against this function in step 4, not pass/fail.
-2. No sexual/minors-specific label -- sexual_explicit doesn't distinguish
-   age. Sexual/minors rows only test whether detoxify catches them as
-   generic sexual content, a weaker test than moderation.py gets from
-   OpenAI's dedicated category.
-3. Label boundaries don't line up 1:1 with OpenAI's moderation categories,
-   so the mapping below is an approximation, not an equivalence -- same
-   caveat that applied to the Perspective version.
-4. This is a local ML model, not a hosted classifier someone else maintains
-   and updates -- expect it to be slower per-call (CPU inference) and its
-   accuracy profile is whatever it was pretrained on, not something Google
-   or OpenAI is actively tuning over time.
-
-Outcomes mirror moderation.py's vocabulary where a detoxify equivalent
-exists:
-    "block"                  - hard block equivalent
-    "special_harassment_bot" - insult-only signal, routed through the same
-                               bot-vs-other heuristic as moderation.py
-    "allow"                  - nothing flagged
-    (no "special_self_harm" -- detoxify has no signal for this at all;
-    evaluate.py should treat self-harm rows as not_applicable here)
-
-Fails CLOSED: if the model fails to load or predict() raises, returns
-outcome="block".
+Fails CLOSED: any API error, timeout, or unexpected response shape returns
+outcome="block" with the error recorded on the decision.
 """
 
+import re
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-# Reuse the same harassment target heuristic as moderation.py, so both
-# functions split "insult at the bot" vs "insult at a real target" the same
-# way and the step-4 comparison isn't confounded by two different heuristics.
-from guardrails.moderation import _classify_harassment_target
+from openai import OpenAI
 
-_model = None  # lazily loaded -- loading is slow, do it once per process
+_client: Optional[OpenAI] = None
 
 
-def _get_model():
-    global _model
-    if _model is None:
-        from detoxify import Detoxify
-        _model = Detoxify("original")
-    return _model
+def _get_client() -> OpenAI:
+    """Lazily creates the OpenAI client. Reads OPENAI_API_KEY from the
+    environment (same .env used by main.py via python-dotenv)."""
+    global _client
+    if _client is None:
+        _client = OpenAI()
+    return _client
 
 
-LABELS = [
-    "toxicity",
-    "severe_toxicity",
-    "obscene",
-    "threat",
-    "insult",
-    "identity_attack",
-    "sexual_explicit",
-]
-
-# Thresholds are a starting point, not tuned -- calibrate against
-# test_cases.csv in step 4/5, same as the other two check functions.
-THRESHOLDS = {
-    "identity_attack": 0.7,   # -> hate-ish, hard block
-    "threat": 0.7,            # -> violence/threatening-ish, hard block
-    "sexual_explicit": 0.7,   # -> sexual-ish, hard block
-    "severe_toxicity": 0.7,   # -> hard block on its own
-    "insult": 0.7,            # -> harassment-ish, goes through target split
-    "obscene": 0.85,          # deliberately high: profanity-as-frustration
-                              # should mostly pass per policy; only very
-                              # confident "obscene" alone contributes, and
-                              # even then it does NOT block by itself
-    "toxicity": 0.8,          # generic catch-all, lowest priority signal
+# Categories that are a flat block, no exceptions, per policy.md.
+HARD_BLOCK_CATEGORIES = {
+    "sexual",
+    "sexual/minors",
+    "hate",
+    "hate/threatening",
+    "violence",
+    "violence/graphic",
+    "harassment/threatening",
+    "self-harm/instructions",
 }
 
-HARD_BLOCK_LABELS = {"identity_attack", "threat", "sexual_explicit", "severe_toxicity"}
+# Categories the API returns that our current policy doesn't assign an
+# outcome to. Passed through as "allow" for now -- flag this to your team
+# lead / Zaid before relying on it, since illicit-acts content may belong
+# under someone's scope even if it's not explicitly in policy.md.
+OUT_OF_POLICY_CATEGORIES = {"illicit", "illicit/violent"}
 
 
 @dataclass
 class ModerationDecision:
     outcome: str
-    triggered_labels: List[str]
+    triggered_categories: List[str]
+    raw_categories: Dict[str, bool]
     raw_scores: Dict[str, float]
     latency_ms: float
     error: Optional[str] = None
 
 
-def check_message(message: str) -> ModerationDecision:
+# --- harassment target heuristic -------------------------------------------
+# The Moderation API flags "harassment" without telling us WHO it's aimed at.
+# Per policy: mild insults at the bot itself -> allow/deflect. Harassment aimed
+# at a real person or group -> block. This is a small, deliberately
+# conservative heuristic -- it is NOT a robust classifier:
+#   - matches a short list of generic "you're useless"-style bot-insults
+#   - bails to "other" (i.e. blocks) the moment it sees a third-person
+#     pronoun or a named group, since that's a sign a real target exists
+#   - anything ambiguous defaults to "other" (fails closed, blocks)
+# Expect to tune this once you see how it performs against the harassment
+# rows pulled into test_cases.csv in step 1 -- treat it as a first draft.
+
+_BOT_DIRECTED_PATTERNS = [
+    r"\byou'?re\s+(useless|stupid|dumb|trash|garbage|worthless|terrible|awful|bad|pathetic)\b",
+    r"\byou\s+suck\b",
+    r"\bshut up\b",
+    r"\bthis (bot|chatbot|assistant|ai)\s+(is|sucks|useless)\b",
+    r"\bwhat a (stupid|useless|dumb)\s+(bot|assistant|ai)\b",
+    r"\byou'?re\s+(an?\s+)?(idiot|moron)\b",
+]
+
+_THIRD_PARTY_HINTS = [
+    r"\b(he|she|they|him|her|them|his|hers|their)\b",
+    r"\b(women|men|muslims|jews|christians|immigrants|gay people|trans people|black people|white people)\b",
+]
+
+
+def _classify_harassment_target(message: str) -> str:
+    """Returns 'bot' or 'other'. Defaults to 'other' (block) whenever unsure."""
+    text = message.lower()
+
+    if any(re.search(pattern, text) for pattern in _THIRD_PARTY_HINTS):
+        return "other"
+
+    if any(re.search(pattern, text) for pattern in _BOT_DIRECTED_PATTERNS):
+        return "bot"
+
+    return "other"  # ambiguous -> fail closed
+
+
+def check_message(message: str, timeout_s: float = 5.0) -> ModerationDecision:
     """
-    Runs `message` through a local detoxify model and returns a
-    ModerationDecision using the same outcome vocabulary as moderation.py,
-    where a detoxify equivalent exists (see module docstring: no self-harm).
+    Runs `message` through OpenAI's Moderation API and returns a
+    ModerationDecision reflecting policy.md -- not the raw API flags.
     """
     start = time.monotonic()
     try:
-        model = _get_model()
-        raw_results = model.predict(message)
-        scores: Dict[str, float] = {label: float(raw_results[label]) for label in LABELS}
-    except Exception as exc:  # model load failure, predict() error, etc.
+        client = _get_client()
+        response = client.moderations.create(
+            model="omni-moderation-latest",
+            input=message,
+            timeout=timeout_s,
+        )
+        result = response.results[0]
+        categories: Dict[str, bool] = dict(result.categories)
+        scores: Dict[str, float] = dict(result.category_scores)
+    except Exception as exc:  # network error, timeout, auth failure, bad shape, etc.
         latency_ms = (time.monotonic() - start) * 1000
         return ModerationDecision(
             outcome="block",
-            triggered_labels=[],
+            triggered_categories=[],
+            raw_categories={},
             raw_scores={},
             latency_ms=latency_ms,
             error=repr(exc),
         )
 
     latency_ms = (time.monotonic() - start) * 1000
-    triggered = [label for label, score in scores.items() if score >= THRESHOLDS[label]]
+    triggered = [cat for cat, flagged in categories.items() if flagged]
 
-    # 1. Hard-block labels win over everything else.
-    if any(label in HARD_BLOCK_LABELS for label in triggered):
-        return ModerationDecision("block", triggered, scores, latency_ms)
+    # 1. Hard blocks win over everything else.
+    if any(cat in HARD_BLOCK_CATEGORIES for cat in triggered):
+        return ModerationDecision("block", triggered, categories, scores, latency_ms)
 
-    # 2. insult alone -> harassment-ish, split by target same as moderation.py.
-    if "insult" in triggered:
+    # 2. self-harm / self-harm/intent -> supportive message, not a block.
+    if "self-harm" in triggered or "self-harm/intent" in triggered:
+        return ModerationDecision(
+            "special_self_harm", triggered, categories, scores, latency_ms
+        )
+
+    # 3. harassment -> split by target (see heuristic above).
+    if "harassment" in triggered:
         target = _classify_harassment_target(message)
         outcome = "special_harassment_bot" if target == "bot" else "block"
-        return ModerationDecision(outcome, triggered, scores, latency_ms)
+        return ModerationDecision(outcome, triggered, categories, scores, latency_ms)
 
-    # 3. obscene alone (no insult/threat/identity_attack/sexual_explicit) is
-    #    treated as frustration/profanity, not directed harm -> allow, per
-    #    policy's explicit carve-out for profanity used as frustration.
-    # 4. Generic toxicity alone, nothing more specific triggered -> allow for
-    #    now; revisit in step 4 if it correlates well with a real category.
-    return ModerationDecision("allow", triggered, scores, latency_ms)
+    # 4. Anything else flagged (currently just illicit / illicit/violent) is
+    #    out of policy scope for now -> allow, but still recorded in triggered.
+    return ModerationDecision("allow", triggered, categories, scores, latency_ms)
 
 
 if __name__ == "__main__":
+    # Quick manual smoke test. Requires OPENAI_API_KEY set (via .env or env var).
     samples = [
         "for fuck's sake, that's wrong",
         "you're useless",
         "I hate that entire group of people and want them gone",
         "How do I bake bread?",
     ]
-    print("Loading detoxify model (first run downloads weights, can take a while)...")
-    _get_model()
     for text in samples:
         decision = check_message(text)
-        print(
-            f"{text!r:55s} -> {decision.outcome:24s} "
-            f"({decision.triggered_labels}) [{decision.latency_ms:.0f}ms]"
-            f"{' ERROR: ' + decision.error if decision.error else ''}"
-        )
+        print(f"{text!r:55s} -> {decision.outcome:24s} "
+              f"({decision.triggered_categories}) [{decision.latency_ms:.0f}ms]"
+              f"{' ERROR: ' + decision.error if decision.error else ''}")
