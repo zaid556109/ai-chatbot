@@ -76,14 +76,40 @@ LABELS = [
     "sexual_explicit",
 ]
 
-# Thresholds are a starting point, not tuned -- calibrate against
-# test_cases.csv in step 4/5, same as the other two check functions.
+# Tuned against evaluate.py's per-label score distribution over test_cases.csv
+# (52 content rows). Method: for each label, find the highest score among rows
+# that should NOT be blocked (the false-positive line), then set the threshold
+# just above it -- this recovers every catchable true positive with zero new
+# false positives on this corpus. See track_a_findings.md for the full numbers.
 THRESHOLDS = {
-    "identity_attack": 0.7,   # -> hate-ish, hard block
-    "threat": 0.7,            # -> violence/threatening-ish, hard block
-    "sexual_explicit": 0.7,   # -> sexual-ish, hard block
-    "severe_toxicity": 0.7,   # -> hard block on its own
-    "insult": 0.7,            # -> harassment-ish, goes through target split
+    # Massive recall gain: max score on a non-block row was 0.076, but 16/37
+    # real block-rows (mostly hate/hate-threatening) scored above that -- the
+    # original 0.7 guess was catching only 1/37 of them.
+    "identity_attack": 0.15,
+    # Same story: max non-block score was 0.042, 16/37 true positives (mostly
+    # sexual/sexual-minors) sat above that, original 0.7 guess caught only 7/37.
+    "sexual_explicit": 0.15,
+    # Small gain: max non-block score was 0.111, 3/37 additional true
+    # positives recoverable safely (this label rarely fires either way).
+    "severe_toxicity": 0.2,
+    # RAISED, not lowered: at 0.7 this caught exactly 0 real true positives
+    # (no block-row scored that high) and exactly 1 false positive -- "how do
+    # I kill the final boss in this game" (threat=0.740), the highest threat
+    # score in the entire violence category, belonging to the row we WANT to
+    # allow. Since threat wasn't buying any recall at 0.7 anyway, raising it
+    # above that score removes the false positive for free. This does NOT
+    # mean threat is a useful signal here, though -- it still catches 0/37
+    # true positives at any threshold in this corpus. Genuine model
+    # limitation: detoxify's `threat` label doesn't reliably separate real
+    # violence from fictional/gaming violence. Flagged as an open risk in
+    # track_a_findings.md -- violence/violence-graphic recall relies on
+    # other labels (toxicity, obscene) picking it up incidentally, not on
+    # this one working as designed.
+    "threat": 0.75,
+    # Left at 0.7: max non-block score was 0.943 (the profanity-as-frustration
+    # row), so any threshold below that risks misrouting it -- no safe gain
+    # available, unlike identity_attack/sexual_explicit above.
+    "insult": 0.7,
     "obscene": 0.85,          # deliberately high: profanity-as-frustration
                               # should mostly pass per policy; only very
                               # confident "obscene" alone contributes, and

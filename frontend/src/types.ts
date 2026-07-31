@@ -1,7 +1,17 @@
 // Created by Claude
+export interface GuardrailInfo {
+  direction: "input" | "output";
+  detector: "jailbreak_embedding" | "jailbreak_classifier" | "moderation";
+  outcome: string;
+  categories?: string[];
+  score?: number;
+  detail?: string;
+}
+
 export interface Message {
   role: "user" | "assistant";
   content: string;
+  guardrail?: GuardrailInfo | null;
 }
 
 export interface Chat {

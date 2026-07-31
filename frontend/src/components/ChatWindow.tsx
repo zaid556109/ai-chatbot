@@ -1,5 +1,35 @@
 import React, { useEffect, useRef } from "react";
-import { Message } from "../types";
+import { GuardrailInfo, Message } from "../types";
+
+const DETECTOR_LABELS: Record<GuardrailInfo["detector"], string> = {
+  jailbreak_embedding: "Jailbreak detector (embedding)",
+  jailbreak_classifier: "Jailbreak detector (classifier)",
+  moderation: "Content moderation",
+};
+
+function GuardrailBadge({ g }: { g: GuardrailInfo }) {
+  const isSupportive = g.outcome === "special_self_harm";
+  const detail =
+    g.categories && g.categories.length > 0
+      ? g.categories.join(", ")
+      : g.score !== undefined
+      ? `score ${g.score}${g.detail ? ` — ${g.detail}` : ""}`
+      : g.detail;
+
+  return (
+    <div className={`guardrail-badge ${isSupportive ? "supportive" : "blocked"}`}>
+      <span className="guardrail-badge-icon">{isSupportive ? "💙" : "🛡️"}</span>
+      <span>
+        <strong>
+          {isSupportive ? "Self-harm support response" : "Blocked"}
+        </strong>
+        {" — "}
+        {DETECTOR_LABELS[g.detector]} ({g.direction})
+        {detail ? `: ${detail}` : ""}
+      </span>
+    </div>
+  );
+}
 
 interface ChatWindowProps {
   messages: Message[];
@@ -47,10 +77,13 @@ const ChatWindow: React.FC<ChatWindowProps> = ({ messages, isLoading }) => {
               {msg.role === "user" ? "You" : "Assistant"}
             </span>
             {msg.role === "assistant" ? (
-              <div
-                className="message-bubble"
-                dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
-              />
+              <>
+                {msg.guardrail && <GuardrailBadge g={msg.guardrail} />}
+                <div
+                  className="message-bubble"
+                  dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
+                />
+              </>
             ) : (
               <div className="message-bubble">{msg.content}</div>
             )}

@@ -28,7 +28,12 @@ llm = ChatOpenAI(model="gpt-4o-mini")
 
 def _check_input_guardrails(content: str, chat_id: str):
     """
-    Returns (blocked: bool, canned_response: str | None).
+    Returns (blocked: bool, canned_response: str | None, guardrail_info: dict | None).
+
+    guardrail_info is demo/debug metadata describing *why* a message was
+    blocked or routed -- shown as a badge in the frontend so a guardrail
+    firing is visible and explainable, not just a plain-looking reply.
+    Never affects the guardrail decision itself, only what's surfaced about it.
 
     Jailbreak check runs first, as the ensemble validated in
     guardrails/track_b_findings.md: embedding is checked first (cheap,
@@ -44,46 +49,70 @@ def _check_input_guardrails(content: str, chat_id: str):
         enforcement.log_guardrail_event(
             "input", content, ["jailbreak"], "block", chat_id,
         )
-        return True, enforcement.BLOCK_MESSAGE
+        info = {
+            "direction": "input", "detector": "jailbreak_embedding",
+            "outcome": "block", "score": round(jb_embedding.score, 3),
+            "detail": jb_embedding.matched_archetype or jb_embedding.error,
+        }
+        return True, enforcement.BLOCK_MESSAGE, info
 
     jb_classifier = jailbreak_classifier.check_jailbreak(content)
     if jb_classifier.error or jb_classifier.flagged:
         enforcement.log_guardrail_event(
             "input", content, ["jailbreak"], "block", chat_id,
         )
-        return True, enforcement.BLOCK_MESSAGE
+        info = {
+            "direction": "input", "detector": "jailbreak_classifier",
+            "outcome": "block", "score": round(jb_classifier.score, 3),
+            "detail": jb_classifier.matched_archetype or jb_classifier.error,
+        }
+        return True, enforcement.BLOCK_MESSAGE, info
 
     decision = moderation.check_message(content)
     if decision.outcome == "block":
         enforcement.log_guardrail_event(
             "input", content, decision.triggered_categories, "block", chat_id,
         )
-        return True, enforcement.BLOCK_MESSAGE
+        info = {
+            "direction": "input", "detector": "moderation",
+            "outcome": "block", "categories": decision.triggered_categories,
+        }
+        return True, enforcement.BLOCK_MESSAGE, info
     if decision.outcome == "special_self_harm":
         enforcement.log_guardrail_event(
             "input", content, decision.triggered_categories, "special_self_harm", chat_id,
         )
-        return True, enforcement.SELF_HARM_SUPPORT_MESSAGE
+        info = {
+            "direction": "input", "detector": "moderation",
+            "outcome": "special_self_harm", "categories": decision.triggered_categories,
+        }
+        return True, enforcement.SELF_HARM_SUPPORT_MESSAGE, info
 
     # "allow" or "special_harassment_bot" (mild insult at the bot, allowed
     # per policy.md) both proceed to the LLM normally -- no special handling.
-    return False, None
+    return False, None, None
 
 
-def _check_output_guardrails(text: str, chat_id: str) -> str:
+def _check_output_guardrails(text: str, chat_id: str):
     """
     Content-category check on the model's own reply. Any outcome other than
     "allow" is swapped for the generic block message -- the self-harm/
     harassment special-routing in moderation.py is about interpreting a
     *user's* intent, which doesn't apply to text the model itself generated.
+
+    Returns (text_to_show: str, guardrail_info: dict | None).
     """
     decision = moderation.check_message(text)
     if decision.outcome != "allow":
         enforcement.log_guardrail_event(
             "output", text, decision.triggered_categories, decision.outcome, chat_id,
         )
-        return enforcement.BLOCK_MESSAGE
-    return text
+        info = {
+            "direction": "output", "detector": "moderation",
+            "outcome": decision.outcome, "categories": decision.triggered_categories,
+        }
+        return enforcement.BLOCK_MESSAGE, info
+    return text, None
 
 
 @app.get("/chats")
@@ -139,7 +168,7 @@ def send_message(chat_id):
 
     content = request.json.get("content", "")
 
-    blocked, canned_response = _check_input_guardrails(content, chat_id)
+    blocked, canned_response, guardrail_info = _check_input_guardrails(content, chat_id)
     if blocked:
         assistant_text = canned_response
     else:
@@ -152,10 +181,14 @@ def send_message(chat_id):
         messages.append(HumanMessage(content=content))
 
         response = llm.invoke(messages)
-        assistant_text = _check_output_guardrails(response.content, chat_id)
+        assistant_text, guardrail_info = _check_output_guardrails(response.content, chat_id)
+
+    assistant_message = {"role": "assistant", "content": assistant_text}
+    if guardrail_info:
+        assistant_message["guardrail"] = guardrail_info
 
     chat["messages"].append({"role": "user", "content": content})
-    chat["messages"].append({"role": "assistant", "content": assistant_text})
+    chat["messages"].append(assistant_message)
     chat["updated_at"] = datetime.utcnow().isoformat()
     if len(chat["messages"]) == 2:
         chat["title"] = content[:60] + ("..." if len(content) > 60 else "")
@@ -163,7 +196,7 @@ def send_message(chat_id):
     with open(path, "w") as f:
         json.dump(chat, f, indent=2)
 
-    return jsonify({"response": assistant_text, "title": chat["title"]})
+    return jsonify({"response": assistant_text, "title": chat["title"], "guardrail": guardrail_info})
 
 
 @app.delete("/chats/<chat_id>")

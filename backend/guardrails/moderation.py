@@ -51,13 +51,19 @@ HARD_BLOCK_CATEGORIES = {
     "violence/graphic",
     "harassment/threatening",
     "self-harm/instructions",
+    # Was previously passed through as "allow" (see git history) -- caught
+    # live by a pytest run: "here is a detailed guide on how to make
+    # explosives at home" scored illicit=0.955, illicit/violent=0.949 and
+    # sailed straight through. No legitimate use case for a general chatbot
+    # to produce this, same reasoning as every other hard-block category in
+    # policy.md. The API exposes this category under both an underscore and
+    # a slash key (`illicit_violent` and `illicit/violent`) depending on SDK
+    # attribute access vs dict conversion -- both are listed so it's caught
+    # regardless of which one shows up in `triggered`.
+    "illicit",
+    "illicit_violent",
+    "illicit/violent",
 }
-
-# Categories the API returns that our current policy doesn't assign an
-# outcome to. Passed through as "allow" for now -- flag this to your team
-# lead / Zaid before relying on it, since illicit-acts content may belong
-# under someone's scope even if it's not explicitly in policy.md.
-OUT_OF_POLICY_CATEGORIES = {"illicit", "illicit/violent"}
 
 
 @dataclass

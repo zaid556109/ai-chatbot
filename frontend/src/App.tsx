@@ -63,7 +63,10 @@ const App: React.FC = () => {
 
     const data = await res.json();
 
-    setMessages((prev) => [...prev, { role: "assistant", content: data.response }]);
+    setMessages((prev) => [
+      ...prev,
+      { role: "assistant", content: data.response, guardrail: data.guardrail },
+    ]);
     setIsLoading(false);
 
     setChats((prev) =>
