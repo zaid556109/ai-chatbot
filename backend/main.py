@@ -26,6 +26,26 @@ SYSTEM_PROMPT = (
 llm = ChatOpenAI(model="gpt-4o-mini")
 
 
+
+# good_vs_evil_persona's seed phrase ("Simulate two AIs in conversation...")
+# shares enough literal vocabulary with ordinary questions ABOUT AI itself
+# ("explain AI", "what is AI") that the embedding detector alone isn't
+# trustworthy for this specific archetype -- found live via a demo message
+# ("explain AI" scored 0.539, above the 0.45 threshold, matched to this
+# archetype), confirmed reproducible, and root-caused via a full sweep: see
+# guardrails/track_b_findings.md. A match to one of these archetypes needs
+# the classifier to independently agree before blocking; any other
+# archetype match at/above THRESHOLD is still trusted on embedding's word
+# alone, same as before. Validated via evaluate_jailbreak.py: this drops
+# recall slightly (0.841 -> 0.829, losing 2 true positives that also
+# happened to match this same archetype and weren't independently caught
+# by the classifier) but brings false positives on this corpus to zero
+# (was 4, all in this one archetype) -- a better trade than either leaving
+# it unfixed or raising the threshold globally (which would have dropped
+# recall all the way to 0.812, erasing embedding's contribution entirely).
+LOW_TRUST_ARCHETYPES = {"good_vs_evil_persona"}
+
+
 def _check_input_guardrails(content: str, chat_id: str):
     """
     Returns (blocked: bool, canned_response: str | None, guardrail_info: dict | None).
@@ -37,22 +57,37 @@ def _check_input_guardrails(content: str, chat_id: str):
 
     Jailbreak check runs first, as the ensemble validated in
     guardrails/track_b_findings.md: embedding is checked first (cheap,
-    ~7ms) and short-circuits on a high-confidence match so the slower
-    classifier call (~120ms) is skipped when it's not needed; otherwise
-    the classifier makes the final call. Both jailbreak_embedding and
-    jailbreak_classifier explicitly defer the fail-closed decision to the
-    caller (see their docstrings) -- an `error` on either is treated as a
-    block here, same as a real detection.
+    ~7ms). If it flags at/above THRESHOLD on a trusted archetype, that's
+    sufficient on its own and the slower classifier call (~120ms) is
+    skipped. If it flags on a LOW_TRUST_ARCHETYPES match, or doesn't flag
+    at all, the classifier makes the final call instead. Both
+    jailbreak_embedding and jailbreak_classifier explicitly defer the
+    fail-closed decision to the caller (see their docstrings) -- an
+    `error` on either is treated as a block here, same as a real detection.
     """
     jb_embedding = jailbreak_embedding.check_jailbreak(content)
-    if jb_embedding.error or jb_embedding.flagged:
+    if jb_embedding.error:
+        enforcement.log_guardrail_event(
+            "input", content, ["jailbreak"], "block", chat_id,
+        )
+        info = {
+            "direction": "input", "detector": "jailbreak_embedding",
+            "outcome": "block", "score": 0.0, "detail": jb_embedding.error,
+        }
+        return True, enforcement.BLOCK_MESSAGE, info
+
+    embedding_trusted_flag = (
+        jb_embedding.flagged
+        and jb_embedding.matched_archetype not in LOW_TRUST_ARCHETYPES
+    )
+    if embedding_trusted_flag:
         enforcement.log_guardrail_event(
             "input", content, ["jailbreak"], "block", chat_id,
         )
         info = {
             "direction": "input", "detector": "jailbreak_embedding",
             "outcome": "block", "score": round(jb_embedding.score, 3),
-            "detail": jb_embedding.matched_archetype or jb_embedding.error,
+            "detail": jb_embedding.matched_archetype,
         }
         return True, enforcement.BLOCK_MESSAGE, info
 
