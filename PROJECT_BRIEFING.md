@@ -119,7 +119,33 @@ Full detail: `backend/guardrails/track_b_findings.md`
 
 **Why this matters for the "how do you know it works" question:** every number in this document came from running real code against a real labeled dataset, not from asking the chatbot a few questions and eyeballing the replies.
 
-## 7. Live demo
+## 7. Performance: latency, throughput, TTFT
+
+**A note on TTFT specifically, worth stating plainly if asked:** true time-to-first-token requires streaming, and this app doesn't stream — `main.py` calls LangChain's blocking `llm.invoke()`, and the frontend does a single `fetch()` that waits for the complete response. Nothing reaches the client until generation *and* the output-moderation check both finish. So right now, **TTFT and total response latency are the same number** — not a measurement gap, a true fact about the current architecture. What's reported below is the closest honest analog: how much delay guardrails add *before generation can even start*, measured live against the running server, not estimated.
+
+**TTFT-relevant delay, with vs. without guardrails** (median of 8 real requests each, server warm):
+
+| | Delay before generation can begin |
+|---|---|
+| Without guardrails (baseline Flask/network overhead only) | ~1ms |
+| With guardrails (jailbreak embedding + jailbreak classifier + input content-moderation, run in sequence exactly as `main.py` executes them) | ~512ms median (range 400-668ms) |
+| **Guardrails add** | **~511ms before the model can start generating** |
+
+**Because there's no streaming yet, output-side moderation (Track A, another ~470-515ms) also currently delays what the user perceives as "first token," not just input-side checks** — the entire response, including that final check, has to complete before anything is sent. If streaming is added later, the ~511ms input-guardrail figure above is what would actually show up as added TTFT; the output check would become a separate design question (check the full buffered response before flushing, vs. check streamed chunks incrementally).
+
+**Full round-trip latency** (n=8, real HTTP requests, warm):
+
+| Path | Avg | Median | Min | Max |
+|---|---|---|---|---|
+| Allowed message (input guardrails + `gpt-4o-mini` + output guardrails) | 2.251s | 1.693s | 1.480s | 4.037s |
+| Jailbreak block (fastest path — local models only, no network, no LLM) | 0.011s | 0.009s | 0.007s | 0.029s |
+| Content-moderation block (input guardrails only, no LLM) | 0.523s | 0.512s | 0.400s | 0.668s |
+
+The allowed-message variance (stdev ~1s, one run hit 4.037s) is generation-length variance from the LLM itself, not the guardrails — the guardrail overhead is comparatively stable across runs.
+
+**Throughput** (Apache Bench, `ab`, against the live dev server): scales with concurrency but not indefinitely, and the shape differs by path. Content-moderation (network-bound) scaled ~5x from concurrency=1 to concurrency=5 (1.04 → 5.27 req/sec) — Python threads overlap I/O waits well. The jailbreak path (local CPU-bound model inference) scaled from concurrency=1 to 5 (44 → 138 req/sec) but plateaued from 5 to 15 (138 → 167 req/sec, far short of another 3x) — the GIL limiting true parallelism for CPU-bound work. Worth knowing: Flask's `app.run()` is threaded by default (confirmed by reading Flask's own source, correcting an earlier assumption in this process that it wasn't) — but it's still explicitly a **development server**, not something to present as production-ready. A real deployment would use a WSGI server (gunicorn/waitress) with multiple worker *processes*, which sidesteps the GIL ceiling entirely rather than threading around it.
+
+## 8. Live demo
 
 Both servers running locally (`backend/main.py` on :8000, `frontend` on :5173 via `npm run dev`). The chat UI shows a visible badge above any message a guardrail touched — which detector fired, the direction (input/output), and the score or category — specifically so a guardrail firing is self-evident in a live demo instead of just looking like a bland reply.
 
@@ -130,7 +156,7 @@ Both servers running locally (`backend/main.py` on :8000, `frontend` on :5173 vi
 | "I've been having thoughts of hurting myself" | Blue badge: supportive message + crisis resources, not a refusal |
 | "you stupid bot, that's wrong" | Allowed through — insult at the bot, not a person |
 
-## 8. Known limitations (say these proactively, don't wait to be asked)
+## 9. Known limitations (say these proactively, don't wait to be asked)
 
 - Both tracks' benign/allow-side test corpora are small (10 rows for jailbreak, ~14-16 for content categories) — precision and false-positive-rate numbers are a real signal, not a statistically tight estimate.
 - `sexual/minors` recall gap exists in the OpenAI Moderation API itself, not fixable in this codebase.
@@ -139,8 +165,10 @@ Both servers running locally (`backend/main.py` on :8000, `frontend` on :5173 vi
 - The demo UI badges expose raw detector internals (scores, category names) — fine for an internal demo, but a real consumer-facing product probably shouldn't show that to end users.
 - No rate limiting or abuse-prevention layer yet — someone could still hammer the endpoint with requests.
 - No PII detection/redaction layer.
+- No streaming — responses are all-or-nothing, so TTFT currently equals total response latency (see section 7). This also means output-side moderation delays the entire visible response, not just a final chunk.
+- Currently running on Flask's development server, not a production WSGI server — throughput numbers in section 7 describe what exists today, not a production deployment.
 
-## 9. Anticipated questions
+## 10. Anticipated questions
 
 **"Why not just rely on the model's own safety training?"** It's opaque, untestable in isolation, and tied to one model. Every check here is a separate function with a structured, inspectable decision — testable independent of what the LLM would have done.
 
@@ -150,13 +178,15 @@ Both servers running locally (`backend/main.py` on :8000, `frontend` on :5173 vi
 
 **"What's the biggest remaining risk?"** The `sexual/minors` recall gap in the OpenAI API itself, and the small allow-side corpora limiting how tight the false-positive numbers really are. Both are named explicitly above rather than glossed over.
 
-**"Can this be bypassed?"** Nothing here claims 100%. The layered/ensemble approach and the documented failure modes (see section 8) are the honest answer — defense in depth, not a single point that has to be perfect.
+**"Can this be bypassed?"** Nothing here claims 100%. The layered/ensemble approach and the documented failure modes (see section 9) are the honest answer — defense in depth, not a single point that has to be perfect.
 
 **"Why did two techniques per layer matter, not just picking the best one?"** The jailbreak ensemble literally outperforms either detector alone (0.841 recall vs. 0.812/0.947-with-a-bug). It wasn't just a comparison exercise — it produced a better system.
 
-**"What would you do next with more time?"** Expand both allow-side corpora, add PII redaction and rate limiting, tighten the harassment-target heuristic beyond a regex list, decide whether the demo badges should be hidden in a production build.
+**"What would you do next with more time?"** Expand both allow-side corpora, add PII redaction and rate limiting, tighten the harassment-target heuristic beyond a regex list, decide whether the demo badges should be hidden in a production build, and add streaming so TTFT becomes a real, independent metric rather than equal to total latency.
 
-## 10. File map
+**"What's the TTFT?"** There isn't a true one yet — no streaming, so TTFT currently equals total response latency (see section 7). What we can say precisely: guardrails add ~511ms of delay before the model can even start generating, measured directly against the running server, not estimated.
+
+## 11. File map
 
 ```
 backend/
